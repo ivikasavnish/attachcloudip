@@ -1,0 +1,16 @@
+[Unit]
+Description=AttachCloudIP Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/attachcloudip
+ExecStart=/home/ubuntu/attachcloudip/bin/server -config config/tunnel.yaml
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/attachcloudip/logs/server.log
+StandardError=append:/home/ubuntu/attachcloudip/logs/server.error.log
+
+[Install]
+WantedBy=multi-user.target

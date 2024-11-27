@@ -1,0 +1,21 @@
+server:
+  host: localhost  # Replace with your server hostname
+  ssh:
+    port: 22
+    username: user  # Replace with your SSH username
+    key_path: /path/to/your/key.pem  # Replace with your SSH key path
+  ports:
+    http: 9999           # External HTTP API port
+    grpc: 9998          # Internal gRPC communication port
+    registration: 9997   # TCP registration port
+  routing:
+    path_matching:
+      case_sensitive: false
+      trailing_slash: ignore  # ignore, require, or forbid
+    paths:
+      - pattern: "/api/*"
+        description: "Example API endpoint"
+        required_auth: true
+      - pattern: "/web/*"
+        description: "Example web endpoint"
+        required_auth: false

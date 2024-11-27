@@ -1,0 +1,44 @@
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Config and sensitive files
+*.env
+.env
+.env.*
+config/*.yaml
+!config/tunnel.yaml.example
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+*.password
+*.secret
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Build and binary directories
+bin/
+dist/
+build/
+
+# Log files
+*.log
+logs/

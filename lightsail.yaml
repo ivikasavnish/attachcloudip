@@ -1,0 +1,5 @@
+name: Lightsail
+host: dev.servloci.in
+port: 22
+username: ubuntu
+ssh_key_path: /home/vikasavn/devserver/lightsail.pem
