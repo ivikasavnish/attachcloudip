@@ -97,6 +97,48 @@ Options:
    - Method: GET
    - Response: List of connected clients with their status
 
+## API Examples
+
+### Sample CURL Commands
+
+1. Check Server Health
+```bash
+curl -X GET http://localhost:9999/health
+```
+Response:
+```json
+{"status": "ok"}
+```
+
+2. Register a Client
+```bash
+curl -X POST http://localhost:9999/register \
+  -H "Content-Type: application/json" \
+  -d '{"client_id": "test-client", "paths": ["/test/path"]}'
+```
+Response:
+```json
+{"port": 9998}
+```
+
+3. List Connected Clients
+```bash
+curl -X GET http://localhost:9999/clients
+```
+Response:
+```json
+{
+  "clients": [
+    {
+      "id": "test-client",
+      "path": "/test/path",
+      "last_active": "2024-01-20T15:30:45Z",
+      "status": "connected"
+    }
+  ]
+}
+```
+
 ## Development
 
 ### Project Structure
