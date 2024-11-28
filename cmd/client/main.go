@@ -1,146 +1,207 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"os/signal"
-	"runtime"
-	"syscall"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/vikasavn/attachcloudip/pkg/config"
-	"github.com/vikasavn/attachcloudip/pkg/service"
 )
 
-type Logger struct {
-	*log.Logger
+func init() {
+	log.SetFlags(log.Llongfile)
 }
 
-func (l *Logger) Printf(format string, v ...interface{}) {
-	_, file, line, _ := runtime.Caller(1)
-	l.Logger.Printf(fmt.Sprintf("%s:%d: %s", file, line, format), v...)
+type Client struct {
+	ID         string
+	TCPConn    net.Conn
+	TCPPort    int
+	serverHost string
+	path       string
 }
 
-func (l *Logger) Fatalf(format string, v ...interface{}) {
-	_, file, line, _ := runtime.Caller(1)
-	l.Logger.Fatalf(fmt.Sprintf("%s:%d: %s", file, line, format), v...)
+func registerClient(serverAddr string, clientID string, path string) (*Client, error) {
+	// Prepare registration request
+	registrationPayload := struct {
+		ClientID string   `json:"client_id"`
+		Paths    []string `json:"paths"`
+	}{
+		ClientID: clientID,
+		Paths:    []string{path},
+	}
+
+	payloadBytes, err := json.Marshal(registrationPayload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal registration payload: %v", err)
+	}
+
+	// Send registration request
+	resp, err := http.Post(fmt.Sprintf("http://%s/register", serverAddr),
+		"application/json", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send registration request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("registration failed with status: %d", resp.StatusCode)
+	}
+
+	// Parse registration response
+	var regResponse struct {
+		Port []int `json:"port"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&regResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode registration response: %v", err)
+	}
+
+	// Extract TCP port from JSON response
+	if len(regResponse.Port) == 0 {
+		return nil, fmt.Errorf("no TCP port received from server")
+	}
+	tcpPort := regResponse.Port[0]
+	log.Printf("Received TCP port: %+v", regResponse)
+
+	// Extract host from serverAddr
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server address: %v", err)
+	}
+	log.Printf("Received Host: %+v", host)
+
+	client := &Client{
+		ID:         clientID,
+		TCPPort:    tcpPort,
+		serverHost: host,
+		path:       path,
+	}
+
+	return client, nil
 }
 
-var logger = &Logger{Logger: log.New(os.Stdout, "", log.LstdFlags)}
+func (c *Client) ConnectTCP() error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.serverHost, c.TCPPort))
+	if err != nil {
+		return fmt.Errorf("failed to connect to TCP server: %v", err)
+	}
+	c.TCPConn = conn
 
-var (
-	configFile = flag.String("config", "config/tunnel.yaml", "Path to config file")
-	numWorkers = flag.Int("workers", runtime.NumCPU(), "Number of workers")
-	queueSize  = flag.Int("queue", 100, "Job queue size")
-)
+	// Send initial registration message with client ID and path
+	registrationMsg := fmt.Sprintf("%s|%s\n", c.ID, c.path)
+	log.Println(registrationMsg)
+	if _, err := c.TCPConn.Write([]byte(registrationMsg)); err != nil {
+		return fmt.Errorf("failed to send registration message: %v", err)
+	}
+	log.Println("Registration message sent and waiting for confirmation...")
+
+	go func() {
+		// Wait for registration confirmation
+		buf := make([]byte, 1024)
+		n, err := c.TCPConn.Read(buf)
+		if err != nil {
+			fmt.Printf("failed to read registration confirmation: %v", err)
+			return
+		}
+
+		response := strings.TrimSpace(string(buf[:n]))
+		if response != "registered" {
+			fmt.Printf("unexpected registration response: %s", response)
+			return
+		}
+
+		log.Printf("Successfully registered with server")
+	}()
+	return nil
+}
+
+func (c *Client) sendMessage(message string) error {
+	_, err := c.TCPConn.Write([]byte(message + "\n"))
+	return err
+}
+
+func (c *Client) receiveMessage() (string, error) {
+	buf := make([]byte, 1024)
+	n, err := c.TCPConn.Read(buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+func (c *Client) receiveMessages() {
+	for {
+		message, err := c.receiveMessage()
+		if err != nil {
+			log.Printf("Failed to receive message: %v", err)
+			return
+		}
+
+		message = strings.TrimSpace(message)
+
+		// Handle heartbeat acknowledgment
+		if message == "heartbeat-ack" {
+			log.Printf("Received heartbeat acknowledgment from server")
+			continue
+		}
+
+		log.Printf("Received message: '%s'", message)
+	}
+}
+
+func (c *Client) startHeartbeat(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		log.Printf("Sending heartbeat...")
+		if err := c.sendMessage("heartbeat"); err != nil {
+			log.Printf("Failed to send heartbeat: %v", err)
+			return
+		}
+	}
+}
 
 func main() {
+	// Command line flags
+	serverAddr := flag.String("server", "localhost:9999", "Server address")
+	watchPath := flag.String("path", "", "Path to watch for changes")
 	flag.Parse()
 
-	paths := flag.Args()
-	if len(paths) == 0 {
-		logger.Fatal("No paths specified. Usage: client -config <config-file> <paths>")
+	if *watchPath == "" {
+		log.Fatal("Path is required. Use -path flag to specify the path to watch")
 	}
 
-	// Load configuration
-	cfg, err := config.LoadConfig(*configFile)
+	// Generate a unique client ID
+	clientID := uuid.New().String()
+	log.Printf("Generated client ID: %s", clientID)
+
+	client, err := registerClient(*serverAddr, clientID, *watchPath)
 	if err != nil {
-		logger.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("Failed to register client: %v", err)
 	}
 
-	// Generate unique client ID
-	cfg.Client.ID = uuid.New().String()
-
-	// Create tunnel service
-	tunnelService := service.NewTunnelService([]int{}) // Client doesn't need to pre-allocate ports
-
-	// Prepare connection options
-	connOpts := &service.ConnectionOptions{
-		Protocol:          service.ConnectionOptionsProtocol_HTTP,
-		BufferSize:        32 * 1024, // 32KB buffer
-		KeepAlive:         true,
-		KeepAliveInterval: 30,
-		IdleTimeout:       300,
+	log.Println("connecting to TCP server...")
+	if err := client.ConnectTCP(); err != nil {
+		log.Printf("failed to connect to TCP server: %v", err)
+		return
 	}
+	log.Printf("Received client: %+v", client)
+	log.Printf("Client registered with ID: %s", client.ID)
 
-	// Create main context and cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	log.Println("Client started")
 
-	// Wait for interrupt signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// Start receiving messages in a separate goroutine
+	go client.receiveMessages()
 
-	// Register client
-	logger.Printf("Registering client with ID %s for paths: %v", cfg.Client.ID, paths)
-	regResp, err := tunnelService.Register(ctx, &service.StreamRequest{
-		Type:      service.StreamRequestType_PATH_UPDATE,
-		RequestId: cfg.Client.ID,
-		Protocol:  "tcp",
-		HttpRequest: &service.HttpRequest{
-			Path: paths[0],
-		},
-	})
-	if err != nil {
-		logger.Fatalf("Failed to register: %v", err)
-	}
+	// Start heartbeat in a separate goroutine
+	go client.startHeartbeat(2 * time.Second)
 
-	logger.Printf("Registration successful - Session ID: %s, Port: %d", regResp.RequestId, regResp.Port)
-
-	// Complete registration handshake
-	if err := completeHandshake(cfg.Client.ID, regResp.Port); err != nil {
-		logger.Fatalf("Handshake failed: %v", err)
-	}
-
-	// Start heartbeat goroutine
-	go func() {
-		ticker := time.NewTicker(time.Duration(connOpts.KeepAliveInterval) * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := sendHeartbeat(cfg.Client.ID); err != nil {
-					logger.Printf("Failed to send heartbeat: %v", err)
-				}
-			}
-		}
-	}()
-
-	// Wait for interrupt signal
-	<-sigChan
-	logger.Println("Shutdown signal received, closing connection...")
-	cancel()
-
-	logger.Println("Client shutdown complete")
-}
-
-func completeHandshake(clientID string, port int) error {
-	// Connect to the assigned port
-	conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
-	if err != nil {
-		return fmt.Errorf("failed to connect for handshake: %w", err)
-	}
-	defer conn.Close()
-
-	// Send client ID as handshake
-	_, err = conn.Write([]byte(clientID))
-	if err != nil {
-		return fmt.Errorf("failed to send handshake: %w", err)
-	}
-
-	return nil
-}
-
-func sendHeartbeat(clientID string) error {
-	// Implementation of heartbeat
-	// This would typically make an HTTP request to the server's heartbeat endpoint
-	return nil
+	// Keep the main function running
+	select {}
 }
