@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/vikasavn/attachcloudip/pkg/registry"
@@ -37,6 +38,7 @@ func NewHTTPFrontend(reg *registry.Registry, tcpMgr *tcpmanager.TCPManager, disp
 
 // RegisterHandler handles client registration
 func (f *HTTPFrontend) RegisterHandler(w http.ResponseWriter, r *http.Request) {
+	// Ensure only POST method is allowed
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -44,43 +46,97 @@ func (f *HTTPFrontend) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Parse registration request
 	var req struct {
-		Paths    []string          `json:"paths"`
-		Metadata map[string]string `json:"metadata"`
+		ClientID string   `json:"client_id"`
+		Paths    []string `json:"paths"`
+		Protocol string   `json:"protocol"`
 	}
 
+	// Decode the request body
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	// Create stream request
-	streamReq := &service.StreamRequest{
-		Type:     service.StreamRequestType_HTTP_REQUEST,
-		RequestId: uuid.New().String(),
-		Protocol: "tcp",
-		HttpRequest: &service.HttpRequest{
-			Path: req.Paths[0],
-		},
+	// Validate required fields
+	if req.ClientID == "" {
+		http.Error(w, "Client ID is required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Paths) == 0 {
+		http.Error(w, "At least one path is required", http.StatusBadRequest)
+		return
+	}
+	if req.Protocol == "" {
+		http.Error(w, "Protocol is required", http.StatusBadRequest)
+		return
 	}
 
-	// Register with tunnel service
-	resp, err := f.tunnelService.Register(r.Context(), streamReq)
+	// Validate protocol type
+	var clientType registry.ClientType
+	switch strings.ToLower(req.Protocol) {
+	case "http":
+		clientType = registry.ClientTypeHTTP
+	case "tcp":
+		clientType = registry.ClientTypeTCP
+	default:
+		http.Error(w, "Invalid protocol type. Must be 'http' or 'tcp'", http.StatusBadRequest)
+		return
+	}
+
+	// Allocate a port for the client
+	port, err := f.tcpManager.GetAvailablePort(10000)
 	if err != nil {
-		f.logger.Printf("Registration failed: %v", err)
-		http.Error(w, fmt.Sprintf("Registration failed: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to allocate port: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Log port allocation
-	f.logger.Printf("Allocated port %d for client %s", resp.Port, resp.RequestId)
+	// Start listener on the allocated port
+	_, err = f.tcpManager.StartOrReuseListener(port)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to start listener on port %d: %v", port, err), http.StatusInternalServerError)
+		return
+	}
 
-	// Return registration response
+	// Prepare metadata for client registration
+	metadata := map[string]string{
+		"protocol": req.Protocol,
+		"source":   "http_registration",
+	}
+
+	// Register the client
+	clientReg, err := f.registry.RegisterClient(req.Paths, clientType, metadata)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to register client: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Update client registration details
+	clientReg.ID = req.ClientID
+	clientReg.TCPPort = port
+
+	// Prepare successful registration response
+	resp := struct {
+		RequestID string `json:"request_id"`
+		ClientID  string `json:"client_id"`
+		Port      int    `json:"port"`
+		Status    string `json:"status"`
+	}{
+		RequestID: uuid.New().String(),
+		ClientID:  req.ClientID,
+		Port:      port,
+		Status:    "success",
+	}
+
+	// Send JSON response
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"client_id": resp.RequestId,
-		"port":      resp.Port,
-		"status":    "success",
-	})
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		f.logger.Printf("Error encoding response: %v", err)
+	}
+
+	// Log successful registration
+	f.logger.Printf(" Client registered: ID=%s, Paths=%v, Protocol=%s, Port=%d", 
+		req.ClientID, req.Paths, req.Protocol, port)
 }
 
 // ProxyHandler routes HTTP requests to registered clients
@@ -204,10 +260,13 @@ func (f *HTTPFrontend) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 // StartServer starts the HTTP frontend server
 func (f *HTTPFrontend) StartServer(addr string) error {
+	// Register HTTP handlers
 	http.HandleFunc("/register", f.RegisterHandler)
 	http.HandleFunc("/status", f.StatusHandler)
+	http.HandleFunc("/clients", f.ClientListHandler)
 	http.HandleFunc("/health", f.HealthHandler)
 	http.HandleFunc("/", f.ProxyHandler)
-	
+
+	f.logger.Printf("Starting HTTP server on %s with routes: /register, /status, /clients, /health, /", addr)
 	return http.ListenAndServe(addr, nil)
 }
