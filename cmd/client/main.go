@@ -26,14 +26,14 @@ type Client struct {
 	path       string
 }
 
-func registerClient(serverAddr string, clientID string, paths []string) (*Client, error) {
+func registerClient(serverAddr string, clientID string, path string) (*Client, error) {
 	// Prepare registration request
 	registrationPayload := struct {
 		ClientID string   `json:"client_id"`
 		Paths    []string `json:"paths"`
 	}{
 		ClientID: clientID,
-		Paths:    paths,
+		Paths:    []string{path},
 	}
 
 	payloadBytes, err := json.Marshal(registrationPayload)
@@ -75,16 +75,11 @@ func registerClient(serverAddr string, clientID string, paths []string) (*Client
 	}
 	log.Printf("Received Host: %+v", host)
 
-	// Use the first path for registration
-	if len(paths) == 0 {
-		return nil, fmt.Errorf("no paths provided for registration")
-	}
-	
 	client := &Client{
 		ID:         clientID,
 		TCPPort:    tcpPort,
 		serverHost: host,
-		path:       paths[0], // Use first path
+		path:       path,
 	}
 
 	return client, nil
@@ -173,27 +168,31 @@ func (c *Client) startHeartbeat(interval time.Duration) {
 }
 
 func main() {
+	// Command line flags
 	serverAddr := flag.String("server", "localhost:9999", "Server address")
+	watchPath := flag.String("path", "", "Path to watch for changes")
 	flag.Parse()
 
-	clientID := uuid.New().String() // Generate a dynamic client ID
-	paths := []string{"/example/path"}
+	if *watchPath == "" {
+		log.Fatal("Path is required. Use -path flag to specify the path to watch")
+	}
 
-	client, err := registerClient(*serverAddr, clientID, paths)
+	// Generate a unique client ID
+	clientID := uuid.New().String()
+	log.Printf("Generated client ID: %s", clientID)
+
+	client, err := registerClient(*serverAddr, clientID, *watchPath)
 	if err != nil {
 		log.Fatalf("Failed to register client: %v", err)
 	}
+
 	log.Println("connecting to TCP server...")
 	if err := client.ConnectTCP(); err != nil {
 		log.Printf("failed to connect to TCP server: %v", err)
+		return
 	}
 	log.Printf("Received client: %+v", client)
 	log.Printf("Client registered with ID: %s", client.ID)
-
-	// Example: Send a message
-	if err := client.sendMessage("Hello Server!"); err != nil {
-		log.Printf("Failed to send message: %v", err)
-	}
 
 	log.Println("Client started")
 

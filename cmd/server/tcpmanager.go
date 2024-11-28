@@ -132,6 +132,9 @@ func (m *TCPManager) handleClient(c net.Conn) {
 	clientID := strings.TrimSpace(parts[0])
 	path := strings.TrimSpace(parts[1])
 
+	// Remove any newlines from path
+	path = strings.ReplaceAll(path, "\n", "")
+
 	if clientID == "" || path == "" {
 		log.Printf("TCP Manager: Invalid registration from %s: empty clientID or path. Message: %s", remoteAddr, initialMsg)
 		return

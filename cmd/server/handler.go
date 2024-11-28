@@ -44,7 +44,11 @@ func RegisterClient(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store the client paths for later use
-	clientManager.RegisterClient(request.ClientID, request.Paths[0]) // Use first path for now
+	// Use first path for now
+	clientManager.RegisterClient(&Client{
+		ClientId: request.ClientID,
+		Paths:    request.Paths,
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
