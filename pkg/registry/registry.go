@@ -19,15 +19,15 @@ const (
 
 // ClientRegistration represents a registered client
 type ClientRegistration struct {
-	ID                  string
-	Type                ClientType
-	Paths               []string
-	LastHeartbeat       time.Time
-	TCPPort             int
+	ID                   string
+	Type                 ClientType
+	Paths                []string
+	LastHeartbeat        time.Time
+	TCPPort              int
 	ActiveTCPConnections int
-	Status              string
-	Metadata            map[string]string
-	mu                  sync.Mutex
+	Status               string
+	Metadata             map[string]string
+	mu                   sync.Mutex
 }
 
 // Registry manages client registrations
@@ -78,14 +78,14 @@ func (r *Registry) RegisterClient(paths []string, clientType ClientType, metadat
 	}
 
 	client := &ClientRegistration{
-		ID:            clientID,
-		Type:          clientType,
-		Paths:         paths,
-		LastHeartbeat: time.Now(),
-		TCPPort:       tcpPort,
+		ID:                   clientID,
+		Type:                 clientType,
+		Paths:                paths,
+		LastHeartbeat:        time.Now(),
+		TCPPort:              tcpPort,
 		ActiveTCPConnections: 0,
-		Status:        "active",
-		Metadata:      metadata,
+		Status:               "active",
+		Metadata:             metadata,
 	}
 
 	// Store client
@@ -97,7 +97,7 @@ func (r *Registry) RegisterClient(paths []string, clientType ClientType, metadat
 	}
 
 	// Debug logging
-	fmt.Printf("Registered client: ID=%s, Type=%v, Paths=%v, TCPPort=%d\n", 
+	fmt.Printf("Registered client: ID=%s, Type=%v, Paths=%v, TCPPort=%d\n",
 		clientID, clientType, paths, tcpPort)
 	fmt.Printf("Current clients: %d\n", len(r.clients))
 
@@ -136,14 +136,14 @@ func (r *Registry) UpdateHeartbeat(clientID string) error {
 
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	
+
 	client.LastHeartbeat = time.Now()
 	client.Status = "active"
-	
+
 	// Log heartbeat with connection info
 	log.Printf("❤️  Heartbeat from client %s (TCP Connections: %d, Last Seen: %s)",
 		clientID, client.ActiveTCPConnections, client.LastHeartbeat.Format(time.RFC3339))
-	
+
 	return nil
 }
 
@@ -156,12 +156,12 @@ func (r *Registry) StartHeartbeatMonitor(interval time.Duration) {
 		for range ticker.C {
 			r.mu.Lock()
 			now := time.Now()
-			
+
 			for id, client := range r.clients {
 				client.mu.Lock()
 				lastBeat := client.LastHeartbeat
 				client.mu.Unlock()
-				
+
 				if now.Sub(lastBeat) > interval*2 {
 					log.Printf("⚠️  Client %s hasn't sent heartbeat in %v", id, now.Sub(lastBeat))
 					client.mu.Lock()
@@ -169,7 +169,7 @@ func (r *Registry) StartHeartbeatMonitor(interval time.Duration) {
 					client.mu.Unlock()
 				}
 			}
-			
+
 			r.mu.Unlock()
 		}
 	}()
@@ -220,18 +220,9 @@ func (r *Registry) ClientCount() int {
 }
 
 // ListClients returns a copy of all registered clients
-func (r *Registry) ListClients() []*ClientRegistration {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	
-	clientList := make([]*ClientRegistration, 0, len(r.clients))
-	for _, client := range r.clients {
-		// Create a copy to prevent direct modification
-		clientCopy := *client
-		clientList = append(clientList, &clientCopy)
-	}
-	
-	return clientList
+func (r *Registry) ListClients() map[string]*ClientRegistration {
+
+	return r.clients
 }
 
 // IncrementTCPConnection increments the active TCP connection count for a client
@@ -270,4 +261,35 @@ func (r *Registry) DecrementTCPConnection(clientID string) error {
 
 	fmt.Printf("Client %s TCP connections: %d\n", clientID, client.ActiveTCPConnections)
 	return nil
+}
+
+// GetNextTCPPort returns the next available TCP port
+func (r *Registry) GetNextTCPPort() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	port := r.availableTCPPort
+	r.availableTCPPort++
+	return port
+}
+
+// RemoveClient removes a client from the registry
+func (r *Registry) RemoveClient(clientID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Remove client from the registry
+	delete(r.clients, clientID)
+
+	// Remove client ID from path mappings
+	for path, ids := range r.pathToClientIDs {
+		for i, id := range ids {
+			if id == clientID {
+				r.pathToClientIDs[path] = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+	}
+
+	log.Printf("[REGISTRY] Removed client %s from registry", clientID)
 }

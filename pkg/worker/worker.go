@@ -1,53 +1,59 @@
 package worker
 
 import (
-	"log"
-	"sync"
+	"context"
+	"fmt"
 )
 
-// Worker represents an individual worker that processes jobs
-type Worker struct {
-	jobQueue   chan Job
-	workerPool chan chan Job
-	stop       chan struct{}
-	wg         sync.WaitGroup
+// Job represents a job that can be executed by a worker
+type Job interface {
+	Execute(ctx context.Context) error
 }
 
-// NewWorker creates a new Worker
+// Worker represents a worker that executes jobs
+type Worker struct {
+	id         int
+	jobQueue   chan Job
+	workerPool chan chan Job
+	quit       chan bool
+}
+
+// NewWorker creates a new worker
 func NewWorker(workerPool chan chan Job) *Worker {
 	return &Worker{
 		jobQueue:   make(chan Job),
 		workerPool: workerPool,
-		stop:       make(chan struct{}),
+		quit:       make(chan bool),
 	}
 }
 
-// Start begins the worker's job processing loop
-func (w *Worker) Start() {
-	w.wg.Add(1)
+// Start begins the worker's processing loop
+func (w *Worker) Start(ctx context.Context) {
 	go func() {
-		defer w.wg.Done()
 		for {
-			// Register this worker's job queue to the worker pool
+			// Add the worker's job queue to the pool
 			w.workerPool <- w.jobQueue
 
 			select {
 			case job := <-w.jobQueue:
-				// Process the job
-				if err := job.Execute(); err != nil {
-					log.Printf("Worker job error: %v", err)
+				// Execute the job
+				if err := job.Execute(ctx); err != nil {
+					fmt.Printf("Error executing job: %v\n", err)
 				}
-			case <-w.stop:
+
+			case <-w.quit:
+				// Stop processing jobs
+				return
+
+			case <-ctx.Done():
+				// Context cancelled, stop processing
 				return
 			}
 		}
 	}()
 }
 
-// Stop halts the worker's job processing
+// Stop signals the worker to stop processing jobs
 func (w *Worker) Stop() {
-	close(w.stop)
-	w.wg.Wait()
-	close(w.jobQueue)
-	close(w.workerPool)
+	w.quit <- true
 }

@@ -1,236 +1,208 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"bytes"
-	"os"
-	"sync"
+	"strings"
 	"time"
-	"gopkg.in/yaml.v2"
 
 	"github.com/google/uuid"
-	"github.com/vikasavn/attachcloudip/pkg/types"
 )
 
-type Config struct {
-	Server struct {
-		Host   string `yaml:"host"`
-		SSH    struct {
-			Port     int    `yaml:"port"`
-			Username string `yaml:"username"`
-			KeyPath  string `yaml:"key_path"`
-		} `yaml:"ssh"`
-		Ports struct {
-			HTTP         int `yaml:"http"`
-			GRPC         int `yaml:"grpc"`
-			Registration int `yaml:"registration"`
-		} `yaml:"ports"`
-	} `yaml:"server"`
+func init() {
+	log.SetFlags(log.Llongfile)
 }
 
 type Client struct {
-	ID      string
-	TCPConn net.Conn
-	TCPPort int
-	mu      sync.Mutex
-	encoder *json.Encoder
-	decoder *json.Decoder
+	ID         string
+	TCPConn    net.Conn
+	TCPPort    int
+	serverHost string
+	path       string
 }
 
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
-}
-
-func (c *Client) SendRequest(req *types.Request) (*types.Response, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Add request metadata
-	if req.ID == "" {
-		req.ID = uuid.New().String()
-	}
-	req.Timestamp = time.Now().Unix()
-
-	if err := c.encoder.Encode(req); err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-
-	var resp types.Response
-	if err := c.decoder.Decode(&resp); err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	return &resp, nil
-}
-
-func (c *Client) StartHeartbeat(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			req := &types.Request{
-				Type: types.RequestTypeHTTP,
-				Path: "/health",
-			}
-			if _, err := c.SendRequest(req); err != nil {
-				log.Printf("❌ Heartbeat failed: %v", err)
-			}
-		}
-	}()
-}
-
-func main() {
-	configPath := flag.String("config", "", "Path to configuration file")
-	clientID := flag.String("id", "", "Client ID (optional)")
-	serverAddr := flag.String("server", "localhost:8080", "Server address")
-	port := flag.Int("port", 0, "Direct port number for local testing (overrides config and server)")
-	flag.Parse()
-
-	if *clientID == "" {
-		*clientID = uuid.New().String()
-	}
-
-	var httpHost string
-	var httpPort int
-
-	if *port != 0 {
-		// Direct port mode for local testing
-		httpHost = "localhost"
-		httpPort = *port
-		log.Printf("Using direct port %d for local testing", *port)
-	} else if *configPath != "" {
-		config, err := loadConfig(*configPath)
-		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
-		}
-		httpHost = config.Server.Host
-		httpPort = config.Server.Ports.HTTP
-		log.Printf("Loaded configuration from %s", *configPath)
-	} else {
-		// Parse server address if no config file
-		host, port, err := net.SplitHostPort(*serverAddr)
-		if err != nil {
-			log.Fatalf("Invalid server address: %v", err)
-		}
-		httpHost = host
-		fmt.Sscanf(port, "%d", &httpPort)
-	}
-
-	// First register via HTTP
-	regReq := struct {
+func registerClient(serverAddr string, clientID string, paths []string) (*Client, error) {
+	// Prepare registration request
+	registrationPayload := struct {
 		ClientID string   `json:"client_id"`
 		Paths    []string `json:"paths"`
-		Protocol string   `json:"protocol"`
 	}{
-		ClientID: *clientID,
-		Paths:    []string{"/"},
-		Protocol: "tcp",
+		ClientID: clientID,
+		Paths:    paths,
 	}
 
-	regBody, err := json.Marshal(regReq)
+	payloadBytes, err := json.Marshal(registrationPayload)
 	if err != nil {
-		log.Fatalf("Failed to marshal registration request: %v", err)
+		return nil, fmt.Errorf("failed to marshal registration payload: %v", err)
 	}
 
-	httpURL := fmt.Sprintf("http://%s:%d/register", httpHost, httpPort)
-	log.Printf("Registering with server at %s", httpURL)
-	
-	resp, err := http.Post(httpURL, "application/json", bytes.NewReader(regBody))
+	// Send registration request
+	resp, err := http.Post(fmt.Sprintf("http://%s/register", serverAddr),
+		"application/json", bytes.NewBuffer(payloadBytes))
 	if err != nil {
-		log.Fatalf("Failed to register with server: %v", err)
+		return nil, fmt.Errorf("failed to send registration request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	var regResp types.Response
-	if err := json.NewDecoder(resp.Body).Decode(&regResp); err != nil {
-		log.Fatalf("Failed to decode registration response: %v", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("registration failed with status: %d", resp.StatusCode)
 	}
 
-	if regResp.Error != "" {
-		log.Fatalf("Registration failed: %s", regResp.Error)
+	// Parse registration response
+	var regResponse struct {
+		Port []int `json:"port"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&regResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode registration response: %v", err)
 	}
 
-	log.Printf("✅ Successfully registered with server")
-	log.Printf("🔌 Assigned TCP port: %d", regResp.Port)
+	// Extract TCP port from JSON response
+	if len(regResponse.Port) == 0 {
+		return nil, fmt.Errorf("no TCP port received from server")
+	}
+	tcpPort := regResponse.Port[0]
+	log.Printf("Received TCP port: %+v", regResponse)
 
-	// Connect to the assigned TCP port
-	tcpAddr := fmt.Sprintf("%s:%d", httpHost, regResp.Port)
-	log.Printf("Connecting to TCP server at %s", tcpAddr)
+	// Extract host from serverAddr
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server address: %v", err)
+	}
+	log.Printf("Received Host: %+v", host)
+
+	// Use the first path for registration
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no paths provided for registration")
+	}
 	
-	conn, err := net.Dial("tcp", tcpAddr)
-	if err != nil {
-		log.Fatalf("Failed to connect to TCP port: %v", err)
-	}
-	defer conn.Close()
-
-	// Create client
 	client := &Client{
-		ID:      *clientID,
-		TCPConn: conn,
-		TCPPort: regResp.Port,
-		encoder: json.NewEncoder(conn),
-		decoder: json.NewDecoder(conn),
+		ID:         clientID,
+		TCPPort:    tcpPort,
+		serverHost: host,
+		path:       paths[0], // Use first path
 	}
 
-	// Send TCP registration request
-	tcpRegReq := &types.Request{
-		ID:   *clientID,
-		Type: types.RequestTypeRegister,
-	}
+	return client, nil
+}
 
-	tcpRegResp, err := client.SendRequest(tcpRegReq)
+func (c *Client) ConnectTCP() error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.serverHost, c.TCPPort))
 	if err != nil {
-		log.Fatalf("Failed to register TCP connection: %v", err)
+		return fmt.Errorf("failed to connect to TCP server: %v", err)
 	}
+	c.TCPConn = conn
 
-	if tcpRegResp.Error != "" {
-		log.Fatalf("TCP registration failed: %s", tcpRegResp.Error)
+	// Send initial registration message with client ID and path
+	registrationMsg := fmt.Sprintf("%s|%s\n", c.ID, c.path)
+	log.Println(registrationMsg)
+	if _, err := c.TCPConn.Write([]byte(registrationMsg)); err != nil {
+		return fmt.Errorf("failed to send registration message: %v", err)
 	}
+	log.Println("Registration message sent and waiting for confirmation...")
 
-	log.Printf("✅ TCP connection established")
+	go func() {
+		// Wait for registration confirmation
+		buf := make([]byte, 1024)
+		n, err := c.TCPConn.Read(buf)
+		if err != nil {
+			fmt.Printf("failed to read registration confirmation: %v", err)
+			return
+		}
 
-	// Start heartbeat
-	client.StartHeartbeat(30 * time.Second)
+		response := strings.TrimSpace(string(buf[:n]))
+		if response != "registered" {
+			fmt.Printf("unexpected registration response: %s", response)
+			return
+		}
 
-	// Example: Send an HTTP request through the server
-	req := &types.Request{
-		Type:   types.RequestTypeHTTP,
-		Path:   "https://api.example.com/data",
-		Method: "GET",
-		Headers: map[string]string{
-			"Accept": "application/json",
-		},
-	}
+		log.Printf("Successfully registered with server")
+	}()
+	return nil
+}
 
-	respitem, err := client.SendRequest(req)
+func (c *Client) sendMessage(message string) error {
+	_, err := c.TCPConn.Write([]byte(message + "\n"))
+	return err
+}
+
+func (c *Client) receiveMessage() (string, error) {
+	buf := make([]byte, 1024)
+	n, err := c.TCPConn.Read(buf)
 	if err != nil {
-		log.Printf("❌ Request failed: %v", err)
-		return
+		return "", err
 	}
-	if respitem.StatusCode >= 400 {
-		log.Printf("❌ Request failed with status code %d: %s",
-			respitem.StatusCode, string(respitem.Body))
-	} else {
-		log.Printf("✅ Response received: status=%d, body=%s",
-			respitem.StatusCode, string(respitem.Body))
+	return string(buf[:n]), nil
+}
+
+func (c *Client) receiveMessages() {
+	for {
+		message, err := c.receiveMessage()
+		if err != nil {
+			log.Printf("Failed to receive message: %v", err)
+			return
+		}
+
+		message = strings.TrimSpace(message)
+
+		// Handle heartbeat acknowledgment
+		if message == "heartbeat-ack" {
+			log.Printf("Received heartbeat acknowledgment from server")
+			continue
+		}
+
+		log.Printf("Received message: '%s'", message)
+	}
+}
+
+func (c *Client) startHeartbeat(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		log.Printf("Sending heartbeat...")
+		if err := c.sendMessage("heartbeat"); err != nil {
+			log.Printf("Failed to send heartbeat: %v", err)
+			return
+		}
+	}
+}
+
+func main() {
+	serverAddr := flag.String("server", "localhost:9999", "Server address")
+	flag.Parse()
+
+	clientID := uuid.New().String() // Generate a dynamic client ID
+	paths := []string{"/example/path"}
+
+	client, err := registerClient(*serverAddr, clientID, paths)
+	if err != nil {
+		log.Fatalf("Failed to register client: %v", err)
+	}
+	log.Println("connecting to TCP server...")
+	if err := client.ConnectTCP(); err != nil {
+		log.Printf("failed to connect to TCP server: %v", err)
+	}
+	log.Printf("Received client: %+v", client)
+	log.Printf("Client registered with ID: %s", client.ID)
+
+	// Example: Send a message
+	if err := client.sendMessage("Hello Server!"); err != nil {
+		log.Printf("Failed to send message: %v", err)
 	}
 
-	// Keep the connection alive
+	log.Println("Client started")
+
+	// Start receiving messages in a separate goroutine
+	go client.receiveMessages()
+
+	// Start heartbeat in a separate goroutine
+	go client.startHeartbeat(2 * time.Second)
+
+	// Keep the main function running
 	select {}
 }
